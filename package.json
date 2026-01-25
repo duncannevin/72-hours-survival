@@ -1,0 +1,42 @@
+{
+  "name": "72-hours-survival",
+  "version": "1.0.0",
+  "description": "AI-powered wilderness survival simulation game using ReAct framework",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "nodemon --exec tsx src/index.ts",
+    "test": "jest",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.1",
+    "@langchain/anthropic": "^0.3.34",
+    "@langchain/core": "^0.3.80",
+    "@modelcontextprotocol/sdk": "^0.6.0",
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.7",
+    "langchain": "^0.3.37"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "nodemon": "^3.1.9",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  },
+  "keywords": [
+    "survival",
+    "game",
+    "ai",
+    "langchain",
+    "mcp",
+    "react"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
