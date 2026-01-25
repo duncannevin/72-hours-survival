@@ -36,12 +36,24 @@ async function main(): Promise<void> {
     console.log('='.repeat(60));
     console.log();
 
-    // Initialize game
+    // Initialize game directly to save API calls
     console.log('Initializing your survival scenario...\n');
-    const initResponse = await agent.invoke({
-      input: 'Initialize the game and tell me my starting situation.',
-    });
-    console.log(`\n${initResponse.output}\n`);
+    try {
+      const initMessage = await game.initializeGameDirectly();
+      console.log(`\n${initMessage}\n`);
+    } catch (error) {
+      // Fallback to agent if direct initialization fails
+      console.log('Using agent for initialization...\n');
+      try {
+        const initResponse = await game.invokeAgentWithRetry(agent, {
+          input: 'Initialize the game and tell me my starting situation.',
+        });
+        console.log(`\n${initResponse.output}\n`);
+      } catch (initError) {
+        const errorMessage = initError instanceof Error ? initError.message : String(initError);
+        console.error(`\nFailed to initialize game: ${errorMessage}\n`);
+      }
+    }
 
     // Main game loop
     while (true) {
@@ -55,12 +67,34 @@ async function main(): Promise<void> {
       if (!action.trim()) continue;
 
       try {
-        const response = await agent.invoke({ 
+        const response = await game.invokeAgentWithRetry(agent, { 
           input: action,
         });
         console.log(`\n${response.output}\n`);
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
+        let errorMessage: string;
+        
+        // Handle overloaded errors with a user-friendly message
+        if (typeof error === 'object' && error !== null) {
+          const err = error as Record<string, unknown>;
+          const errMsg = typeof err.message === 'string' ? err.message.toLowerCase() : '';
+          
+          if (err.type === 'overloaded_error' || 
+              errMsg.includes('overloaded') ||
+              errMsg.includes('service is currently overloaded')) {
+            errorMessage = 'The AI service is currently overloaded. All retry attempts failed. Please wait a few minutes and try again.';
+          } else {
+            errorMessage = error instanceof Error ? error.message : String(error);
+          }
+        } else {
+          const errorStr = String(error).toLowerCase();
+          if (errorStr.includes('overloaded')) {
+            errorMessage = 'The AI service is currently overloaded. Please wait a few minutes and try again.';
+          } else {
+            errorMessage = String(error);
+          }
+        }
+        
         console.error(`\nError: ${errorMessage}\n`);
       }
     }
