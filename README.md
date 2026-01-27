@@ -1,6 +1,6 @@
 # 🏔️ 72-Hour Wilderness Survival Game
 
-An AI-powered, text-based survival simulation where you must survive 72 hours in the Pacific Northwest wilderness. Built with TypeScript, LangChain, and Model Context Protocol (MCP) servers that provide real-time weather data, terrain information, wildlife encounters, and survival knowledge.
+An AI-powered, text-based survival simulation where you must survive 72 hours in wilderness. Built with TypeScript, LangChain, and Model Context Protocol (MCP) servers that provide real-time weather data, terrain information, wildlife encounters, and survival knowledge.
 
 ## 🎮 Game Overview
 
