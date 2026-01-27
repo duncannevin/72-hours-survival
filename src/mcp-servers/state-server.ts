@@ -62,11 +62,36 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'initialize_game',
-        description: 'Start a new game with initial conditions. No parameters required - call with empty object {}',
+        description: 'Start a new game with initial conditions. Optionally provide location coordinates.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            lat: { type: 'number', description: 'Latitude of the survival location' },
+            lon: { type: 'number', description: 'Longitude of the survival location' },
+            location_description: { type: 'string', description: 'Description of the location (e.g., "Rocky Mountains, Colorado")' },
+          },
+          required: [],
+        },
+      },
+      {
+        name: 'get_location',
+        description: 'Get the current game location coordinates',
         inputSchema: {
           type: 'object',
           properties: {},
-          required: [],
+        },
+      },
+      {
+        name: 'set_location',
+        description: 'Update the game location coordinates',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            lat: { type: 'number', description: 'Latitude' },
+            lon: { type: 'number', description: 'Longitude' },
+            description: { type: 'string', description: 'Location description' },
+          },
+          required: ['lat', 'lon'],
         },
       },
       {
@@ -137,10 +162,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   switch (name) {
     case 'initialize_game': {
+      const initArgs = args as {
+        lat?: number;
+        lon?: number;
+        location_description?: string;
+      };
+
       gameState.hours_survived = 0;
       gameState.player_vitals.core_temperature_f = 97.5; // Slightly cold
       gameState.player_vitals.hydration_level = 60; // Thirsty
       gameState.player_vitals.injuries = ['Minor ankle sprain'];
+      
+      // Update location if provided
+      if (initArgs.lat !== undefined && initArgs.lon !== undefined) {
+        gameState.location.lat = initArgs.lat;
+        gameState.location.lon = initArgs.lon;
+      }
+      if (initArgs.location_description) {
+        gameState.location.description = initArgs.location_description;
+      }
       
       return {
         content: [
@@ -149,7 +189,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             text: JSON.stringify({
               message: 'Game initialized. You\'ve been lost for 2 hours already.',
               starting_conditions: gameState.player_vitals,
-              inventory: gameState.inventory
+              inventory: gameState.inventory,
+              location: gameState.location
+            }, null, 2),
+          },
+        ],
+      };
+    }
+
+    case 'get_location': {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(gameState.location, null, 2),
+          },
+        ],
+      };
+    }
+
+    case 'set_location': {
+      const locArgs = args as {
+        lat: number;
+        lon: number;
+        description?: string;
+      };
+
+      gameState.location.lat = locArgs.lat;
+      gameState.location.lon = locArgs.lon;
+      if (locArgs.description) {
+        gameState.location.description = locArgs.description;
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              message: 'Location updated',
+              location: gameState.location
             }, null, 2),
           },
         ],

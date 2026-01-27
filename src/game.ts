@@ -8,15 +8,85 @@ import { AgentExecutor, AgentStep, AgentAction, AgentFinish } from 'langchain/ag
 import { BaseOutputParser } from '@langchain/core/output_parsers';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import axios from 'axios';
+import { z } from 'zod';
 import type { MCPClientInfo, MCPServerConfig } from './types/game.js';
 
-const MAX_ITERATIONS = 6;
+const MAX_ITERATIONS = 10;
+
+interface UserLocation {
+  lat: number;
+  lon: number;
+  city: string;
+  region: string;
+  country: string;
+  description: string;
+}
 const MAX_RETRIES = 5;
 const INITIAL_RETRY_DELAY = 2000;
 const MAX_RETRY_DELAY = 30000;
 
 /**
- * Custom ReAct parser that's more forgiving than the default
+ * Extract JSON from a string, handling extra content after it
+ */
+function extractJSON(str: string): string {
+  const trimmed = str.trim();
+  
+  if (trimmed === '{}' || trimmed.startsWith('{}')) {
+    return '{}';
+  }
+  
+  if (trimmed === '[]' || trimmed.startsWith('[]')) {
+    return '[]';
+  }
+  
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+    const jsonMatch = trimmed.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
+    if (jsonMatch) {
+      return extractJSON(jsonMatch[1]);
+    }
+    return trimmed;
+  }
+  
+  let depth = 0;
+  let inString = false;
+  let escapeNext = false;
+  
+  for (let i = 0; i < trimmed.length; i++) {
+    const char = trimmed[i];
+    
+    if (escapeNext) {
+      escapeNext = false;
+      continue;
+    }
+    
+    if (char === '\\' && inString) {
+      escapeNext = true;
+      continue;
+    }
+    
+    if (char === '"' && !escapeNext) {
+      inString = !inString;
+      continue;
+    }
+    
+    if (!inString) {
+      if (char === '{' || char === '[') {
+        depth++;
+      } else if (char === '}' || char === ']') {
+        depth--;
+        if (depth === 0) {
+          return trimmed.substring(0, i + 1);
+        }
+      }
+    }
+  }
+  
+  return trimmed.split('\n')[0].trim();
+}
+
+/**
+ * Custom ReAct parser
  */
 class FlexibleReActParser extends BaseOutputParser<AgentAction | AgentFinish> {
   private toolNames: string[];
@@ -29,129 +99,84 @@ class FlexibleReActParser extends BaseOutputParser<AgentAction | AgentFinish> {
   lc_namespace = ['langchain', 'agents', 'react'];
 
   getFormatInstructions(): string {
-    return `Use the following format:
-Thought: your reasoning
-Action: tool_name
-Action Input: {"key": "value"}
-OR
-Thought: I now know the final answer
-Final Answer: your final answer`;
+    return `Thought: reasoning\nAction: tool_name\nAction Input: {"key": "value"}`;
   }
 
   async parse(text: string): Promise<AgentAction | AgentFinish> {
-    // Clean up the text
-    const cleanText = text.trim();
-
-    // Check for Final Answer first (multiple patterns)
-    const finalAnswerPatterns = [
-      /Final Answer:\s*([\s\S]*?)$/i,
-      /Final Answer\s*:\s*([\s\S]*?)$/i,
-      /\*\*Final Answer\*\*:\s*([\s\S]*?)$/i,
-    ];
-
-    for (const pattern of finalAnswerPatterns) {
-      const finalMatch = cleanText.match(pattern);
-      if (finalMatch) {
-        return {
-          returnValues: { output: finalMatch[1].trim() },
-          log: cleanText,
-        };
-      }
+    let cleanText = text.trim();
+    
+    // Remove XML-like tags
+    cleanText = cleanText.replace(/<tool_output>[\s\S]*?<\/tool_output>/gi, '');
+    cleanText = cleanText.replace(/<observation>[\s\S]*?<\/observation>/gi, '');
+    cleanText = cleanText.replace(/<result>[\s\S]*?<\/result>/gi, '');
+    
+    // Check for Final Answer
+    const finalAnswerMatch = cleanText.match(/Final Answer:\s*([\s\S]*?)$/i);
+    if (finalAnswerMatch) {
+      return {
+        returnValues: { output: finalAnswerMatch[1].trim() },
+        log: cleanText,
+      };
     }
 
-    // Look for Action and Action Input
-    // More flexible patterns that handle various formats
-    const actionPatterns = [
-      /Action:\s*([^\n]+)/i,
-      /\*\*Action\*\*:\s*([^\n]+)/i,
-      /Action\s*:\s*([^\n]+)/i,
-    ];
+    // Look for Action
+    const actionMatch = cleanText.match(/Action:\s*([^\n<]+)/i);
+    const actionInputMatch = cleanText.match(/Action Input:\s*([\s\S]*)/i);
 
-    const actionInputPatterns = [
-      /Action Input:\s*([\s\S]*?)(?=\n(?:Thought|Observation|Action:|Final Answer)|$)/i,
-      /\*\*Action Input\*\*:\s*([\s\S]*?)(?=\n(?:Thought|Observation|Action:|Final Answer)|$)/i,
-      /Action Input\s*:\s*([\s\S]*?)(?=\n(?:Thought|Observation|Action:|Final Answer)|$)/i,
-    ];
-
-    let action: string | null = null;
+    let action: string | null = actionMatch ? actionMatch[1].trim() : null;
     let actionInput: string | null = null;
-
-    // Find action
-    for (const pattern of actionPatterns) {
-      const match = cleanText.match(pattern);
-      if (match) {
-        action = match[1].trim();
-        break;
-      }
-    }
-
-    // Find action input
-    for (const pattern of actionInputPatterns) {
-      const match = cleanText.match(pattern);
-      if (match) {
-        actionInput = match[1].trim();
-        break;
-      }
+    
+    if (actionInputMatch) {
+      actionInput = extractJSON(actionInputMatch[1]);
     }
 
     if (action && actionInput !== null) {
-      // Validate tool name
-      const normalizedAction = action.toLowerCase().replace(/[^a-z0-9_]/g, '');
+      // Clean action name
+      action = action.replace(/[^a-zA-Z0-9_-]/g, '');
+      
       const matchedTool = this.toolNames.find(
-        (t) => t.toLowerCase() === normalizedAction || t.toLowerCase() === action.toLowerCase()
+        (t) => t.toLowerCase() === action!.toLowerCase()
       );
 
       if (!matchedTool) {
-        // Try to find a close match
         const closeMatch = this.toolNames.find((t) =>
-          t.toLowerCase().includes(normalizedAction) || normalizedAction.includes(t.toLowerCase())
+          t.toLowerCase().includes(action!.toLowerCase()) || 
+          action!.toLowerCase().includes(t.toLowerCase())
         );
 
         if (closeMatch) {
           action = closeMatch;
         } else {
-          throw new Error(
-            `Unknown tool: "${action}". Available tools: ${this.toolNames.join(', ')}`
-          );
+          throw new Error(`Unknown tool: "${action}". Available: ${this.toolNames.join(', ')}`);
         }
       } else {
         action = matchedTool;
       }
 
-      // Parse action input as JSON
+      // Parse JSON
       let parsedInput: Record<string, unknown>;
-
-      // Clean up the action input
       let cleanInput = actionInput
         .replace(/^```json?\s*/i, '')
         .replace(/```\s*$/, '')
         .trim();
 
-      // Handle empty input
       if (!cleanInput || cleanInput === '{}' || cleanInput === 'None' || cleanInput === 'none') {
         parsedInput = {};
       } else {
         try {
           parsedInput = JSON.parse(cleanInput);
         } catch {
-          // Try to fix common JSON issues
           try {
-            // Replace single quotes with double quotes
             const fixedInput = cleanInput
               .replace(/'/g, '"')
-              // Fix trailing commas
               .replace(/,\s*}/g, '}')
               .replace(/,\s*]/g, ']');
             parsedInput = JSON.parse(fixedInput);
           } catch {
-            // If it's a simple string, wrap it
             if (!cleanInput.startsWith('{') && !cleanInput.startsWith('[')) {
-              // Try to infer the parameter name from the tool
               parsedInput = { input: cleanInput };
             } else {
-              throw new Error(
-                `Invalid JSON in Action Input: "${cleanInput}". Must be valid JSON like {"key": "value"} or {} for no parameters.`
-              );
+              throw new Error(`Invalid JSON: "${cleanInput.substring(0, 100)}"`);
             }
           }
         }
@@ -164,16 +189,10 @@ Final Answer: your final answer`;
       };
     }
 
-    // If we can't parse, check if this looks like a direct answer
-    if (
-      !cleanText.toLowerCase().includes('action:') &&
-      !cleanText.toLowerCase().includes('action input:')
-    ) {
-      // The model might be giving a direct answer without the format
-      // Extract everything after the last "Thought:" if present
+    // Check for direct answer
+    if (!cleanText.toLowerCase().includes('action:')) {
       const thoughtMatch = cleanText.match(/Thought:\s*([\s\S]*?)$/i);
       if (thoughtMatch && thoughtMatch[1].length > 50) {
-        // Seems like a substantial response, treat it as final answer
         return {
           returnValues: { output: thoughtMatch[1].trim() },
           log: cleanText,
@@ -182,12 +201,8 @@ Final Answer: your final answer`;
     }
 
     throw new Error(
-      `Could not parse agent output: "${cleanText.substring(0, 200)}..."\n\n` +
-        `Expected format:\n` +
-        `Action: tool_name\n` +
-        `Action Input: {"param": "value"}\n` +
-        `OR\n` +
-        `Final Answer: your answer`
+      `Could not parse: "${cleanText.substring(0, 200)}..."\n` +
+      `Expected: Action: tool_name\\nAction Input: {}`
     );
   }
 }
@@ -196,17 +211,45 @@ export class SurvivalGame {
   private llm: ChatAnthropic;
   private tools: DynamicStructuredTool[];
   private mcpClients: MCPClientInfo[];
+  private userLocation: UserLocation | null = null;
 
   constructor() {
     this.llm = new ChatAnthropic({
       modelName: 'claude-sonnet-4-5-20250929',
-      temperature: 0.3, // Even lower for more consistent formatting
+      temperature: 0.3,
       anthropicApiKey: process.env.ANTHROPIC_API_KEY,
       maxRetries: MAX_RETRIES,
     });
 
     this.tools = [];
     this.mcpClients = [];
+  }
+
+  async detectUserLocation(): Promise<UserLocation> {
+    try {
+      const response = await axios.get('http://ip-api.com/json/', { timeout: 5000 });
+      if (response.data.status === 'success') {
+        const { lat, lon, city, regionName, country } = response.data;
+        this.userLocation = {
+          lat, lon, city,
+          region: regionName,
+          country,
+          description: `Wilderness near ${city}, ${regionName}`,
+        };
+        return this.userLocation;
+      }
+    } catch (error) {
+      console.warn('Could not detect location:', error instanceof Error ? error.message : String(error));
+    }
+
+    this.userLocation = {
+      lat: 47.5, lon: -121.0,
+      city: 'North Bend',
+      region: 'Washington',
+      country: 'United States',
+      description: 'Cascade Mountains, Washington',
+    };
+    return this.userLocation;
   }
 
   private sleep(ms: number): Promise<void> {
@@ -216,47 +259,8 @@ export class SurvivalGame {
   private isOverloadedError(error: unknown): boolean {
     if (typeof error === 'object' && error !== null) {
       const err = error as Record<string, unknown>;
-
-      if (err.error && typeof err.error === 'object') {
-        const innerError = err.error as Record<string, unknown>;
-        if (
-          innerError.type === 'overloaded_error' ||
-          innerError.message === 'Overloaded' ||
-          (typeof innerError.message === 'string' &&
-            innerError.message.toLowerCase().includes('overloaded'))
-        ) {
-          return true;
-        }
-      }
-
-      if (
-        err.type === 'overloaded_error' ||
-        err.message === 'Overloaded' ||
-        (typeof err.message === 'string' && err.message.toLowerCase().includes('overloaded'))
-      ) {
-        return true;
-      }
-
-      if (typeof err.message === 'string') {
-        const msg = err.message.toLowerCase();
-        if (
-          msg.includes('overloaded') ||
-          msg.includes('rate limit') ||
-          msg.includes('429') ||
-          msg.includes('too many requests') ||
-          msg.includes('service is currently overloaded')
-        ) {
-          return true;
-        }
-      }
-
-      const errorString = String(error).toLowerCase();
-      if (
-        errorString.includes('overloaded') ||
-        errorString.includes('429') ||
-        errorString.includes('rate limit') ||
-        errorString.includes('too many requests')
-      ) {
+      const errStr = String(err.message || '').toLowerCase();
+      if (errStr.includes('overloaded') || errStr.includes('rate limit') || errStr.includes('429')) {
         return true;
       }
     }
@@ -275,31 +279,19 @@ export class SurvivalGame {
         return await fn();
       } catch (error) {
         lastError = error;
-
         if (this.isOverloadedError(error) && attempt < maxRetries) {
           const delay = Math.min(initialDelay * Math.pow(2, attempt), MAX_RETRY_DELAY);
-          console.warn(
-            `API overloaded, retrying in ${delay}ms... (attempt ${attempt + 1}/${maxRetries + 1})`
-          );
+          console.warn(`API overloaded, retrying in ${delay}ms...`);
           await this.sleep(delay);
           continue;
         }
-
         if (!this.isOverloadedError(error)) {
           throw error;
-        }
-
-        if (attempt === maxRetries && this.isOverloadedError(error)) {
-          const overloadError = new Error(
-            'The AI service is currently overloaded. All retry attempts failed. Please wait a few minutes and try again.'
-          );
-          (overloadError as Record<string, unknown>).type = 'overloaded_error';
-          throw overloadError;
         }
       }
     }
 
-    throw lastError || new Error('Unknown error occurred after retries');
+    throw lastError || new Error('Unknown error after retries');
   }
 
   async initializeMCPServers(): Promise<void> {
@@ -307,119 +299,143 @@ export class SurvivalGame {
       { name: 'state', script: 'src/mcp-servers/state-server.ts' },
       { name: 'environment', script: 'src/mcp-servers/environment-server.ts' },
       { name: 'knowledge', script: 'src/mcp-servers/knowledge-server.ts' },
+      { name: 'scenario', script: 'src/mcp-servers/scenario-server.ts' },
     ];
 
     for (const server of servers) {
-      const transport = new StdioClientTransport({
-        command: 'tsx',
-        args: [server.script],
-      });
-
-      const client = new Client(
-        {
-          name: 'survival-game-client',
-          version: '1.0.0',
-        },
-        {
-          capabilities: {},
-        }
-      );
-
-      await client.connect(transport);
-      this.mcpClients.push({ name: server.name, client, transport });
-
-      const toolsList = await client.listTools();
-
-      for (const tool of toolsList.tools) {
-        const langchainTool = new DynamicStructuredTool({
-          name: `${server.name}_${tool.name}`,
-          description: tool.description || '',
-          schema: tool.inputSchema,
-          func: async (input: Record<string, unknown>) => {
-            try {
-              const result = await client.callTool({
-                name: tool.name,
-                arguments: input,
-              });
-              const contentArray = result.content as Array<{ type: string; text?: string }>;
-              const content = contentArray[0];
-              if (content && content.type === 'text' && content.text) {
-                return content.text;
-              }
-              return JSON.stringify(result.content);
-            } catch (error) {
-              const errorMessage = error instanceof Error ? error.message : String(error);
-              return JSON.stringify({ error: errorMessage });
-            }
-          },
+      try {
+        const transport = new StdioClientTransport({
+          command: 'tsx',
+          args: [server.script],
         });
 
-        this.tools.push(langchainTool);
-      }
+        const client = new Client(
+          { name: 'survival-game-client', version: '1.0.0' },
+          { capabilities: {} }
+        );
 
-      console.log(`✓ Connected to ${server.name} server (${toolsList.tools.length} tools)`);
+        await client.connect(transport);
+        this.mcpClients.push({ name: server.name, client, transport });
+
+        const toolsList = await client.listTools();
+
+        for (const tool of toolsList.tools) {
+          // Create a permissive schema that accepts any object
+          // This prevents schema validation errors from the agent
+          const permissiveSchema = z.object({}).passthrough();
+
+          const langchainTool = new DynamicStructuredTool({
+            name: `${server.name}_${tool.name}`,
+            description: tool.description || '',
+            schema: permissiveSchema,
+            func: async (input: Record<string, unknown>) => {
+              try {
+                // Filter out any extra properties the LLM might have added
+                // Only pass through properties that the MCP tool actually expects
+                const expectedProps = Object.keys(
+                  (tool.inputSchema as { properties?: Record<string, unknown> })?.properties || {}
+                );
+                
+                const filteredInput: Record<string, unknown> = {};
+                for (const prop of expectedProps) {
+                  if (input[prop] !== undefined) {
+                    filteredInput[prop] = input[prop];
+                  }
+                }
+
+                const result = await client.callTool({
+                  name: tool.name,
+                  arguments: filteredInput,
+                });
+                
+                const contentArray = result.content as Array<{ type: string; text?: string }>;
+                const content = contentArray[0];
+                if (content && content.type === 'text' && content.text) {
+                  return content.text;
+                }
+                return JSON.stringify(result.content);
+              } catch (error) {
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                return JSON.stringify({ error: errorMessage });
+              }
+            },
+          });
+
+          this.tools.push(langchainTool);
+        }
+
+        console.log(`✓ Connected to ${server.name} server (${toolsList.tools.length} tools)`);
+      } catch (error) {
+        console.warn(`⚠ Could not connect to ${server.name} server:`, error instanceof Error ? error.message : String(error));
+      }
     }
 
-    console.log(`\n✓ Loaded ${this.tools.length} tools from ${servers.length} MCP servers\n`);
+    console.log(`\n✓ Loaded ${this.tools.length} tools from MCP servers\n`);
   }
 
   createAgent(): AgentExecutor {
     const toolNames = this.tools.map((t) => t.name);
     const toolNamesStr = toolNames.join(', ');
 
-    // Simplified, cleaner prompt that's less likely to cause parsing issues
-    const PROMPT_TEMPLATE = `You are a wilderness survival expert helping someone lost in Washington's Cascade Mountains.
+    // Build a more detailed tool description that includes parameter info
+    const toolsDescription = this.tools
+      .map((t) => `• ${t.name}: ${t.description}`)
+      .join('\n');
 
-Available tools: {tools}
+    const PROMPT_TEMPLATE = `You are a wilderness survival expert simulating a realistic 72-hour survival scenario.
 
-FORMAT RULES - Follow exactly:
+AVAILABLE TOOLS:
+{tools}
+
+RESPONSE FORMAT (follow exactly):
 
 To use a tool:
 Thought: [your reasoning]
-Action: [tool name from list above]
-Action Input: [valid JSON object, use empty braces if no params needed]
+Action: [exact tool name from list]
+Action Input: [valid JSON - use {{}} for tools with no required parameters]
 
 To give final answer:
-Thought: I have enough information to answer.
-Final Answer: [your helpful response]
+Thought: I have enough information.
+Final Answer: [your response - MUST end with numbered options]
 
-TOOL LIST: ${toolNamesStr}
+TOOLS: ${toolNamesStr}
 
-SURVIVAL PRIORITIES:
-1. Shelter - hypothermia kills in 3 hours
-2. Water - dehydration kills in 3 days  
-3. Fire - warmth, purification, signaling
-4. Food - lowest priority for 72 hours
-5. Signaling - for rescue
+YOUR FINAL ANSWER MUST INCLUDE:
+1. **What Happened**: Describe the outcome of their action (2-3 sentences)
+2. **Current Situation**: The new challenge or situation they face
+3. **Numbered Options**: ALWAYS end with exactly 3 options formatted like this:
 
-EFFICIENCY: Most questions need only 1-2 tool calls. Get info, then give Final Answer immediately.
+Your options:
+1. **[Brief action title]** - [Description of this choice]
+2. **[Brief action title]** - [Description of this choice]  
+3. **[Brief action title]** - [Description of this choice]
 
-COMMON COORDINATES: lat: 47.5, lon: -121.0 (Cascade Mountains)
+RULES FOR OPTIONS:
+- Always provide exactly 3 options
+- Options should be contextually appropriate to the situation
+- Include a mix of safe/risky choices
+- Make options specific to the current scenario
+- Format: Number. **Bold Title** - Description
 
-Begin!
+SURVIVAL PRIORITIES: Shelter > Water > Fire > Food
 
 Question: {input}
 {agent_scratchpad}`;
 
     const prompt = PromptTemplate.fromTemplate(PROMPT_TEMPLATE);
 
-    // Use stop sequences to help the model know when to stop
     const modelWithStop = this.llm.bind({
-      stop: ['\nObservation:', '\nObservation :', 'Observation:'],
+      stop: ['\nObservation:', 'Observation:'],
     });
-
-    const toolsDescription = this.tools
-      .map((t) => `${t.name}: ${t.description}`)
-      .join('\n');
 
     let originalInput = '';
 
     const formatScratchpad = (steps: AgentStep[]): string => {
       if (!steps || steps.length === 0) {
-        return '';
+        return 'Thought:';
       }
 
-      return steps
+      const formatted = steps
         .map((step) => {
           const action = step.action as AgentAction;
           const inputStr =
@@ -427,12 +443,16 @@ Question: {input}
               ? action.toolInput
               : JSON.stringify(action.toolInput);
 
-          return `Thought: ${action.log?.split('Action:')[0]?.replace('Thought:', '').trim() || 'Analyzing...'}
+          const thoughtPart = action.log?.match(/Thought:\s*([^\n]*)/i)?.[1]?.trim() || 'Processing...';
+
+          return `Thought: ${thoughtPart}
 Action: ${action.tool}
 Action Input: ${inputStr}
 Observation: ${step.observation}`;
         })
         .join('\n\n');
+
+      return `${formatted}\n\nThought:`;
     };
 
     const agent = RunnableSequence.from([
@@ -447,16 +467,12 @@ Observation: ${step.observation}`;
             : originalInput;
 
         if (!finalInput || finalInput.trim().length === 0) {
-          throw new Error('Input is required but was not provided');
+          throw new Error('Input is required');
         }
-
-        const scratchpad = formatScratchpad(input.steps || []);
-        // Add "Thought:" prefix if we have scratchpad content to guide the model
-        const scratchpadWithPrompt = scratchpad ? `${scratchpad}\n\nThought:` : 'Thought:';
 
         return {
           input: finalInput,
-          agent_scratchpad: scratchpadWithPrompt,
+          agent_scratchpad: formatScratchpad(input.steps || []),
           tools: toolsDescription,
         };
       },
@@ -470,19 +486,18 @@ Observation: ${step.observation}`;
       tools: this.tools,
       verbose: process.env.NODE_ENV === 'development',
       maxIterations: MAX_ITERATIONS,
-      earlyStoppingMethod: 'generate', // Let model summarize if iterations run out
+      earlyStoppingMethod: 'force',
       handleParsingErrors: (error) => {
         const errorMsg = error instanceof Error ? error.message : String(error);
-        // Return a more helpful error that guides the model
-        return `Parsing error: ${errorMsg}
+        return `Error: ${errorMsg}
 
-Please respond in EXACTLY this format:
-Thought: [your reasoning]
-Action: [one of: ${toolNamesStr}]
-Action Input: {"param": "value"}
+Use this EXACT format:
+Thought: [reasoning]
+Action: [tool from: ${toolNamesStr}]
+Action Input: {"param": "value"} or {}
 
-Or if you're ready to answer:
-Thought: I have the answer.
+Or give final answer:
+Thought: Done.
 Final Answer: [your response]`;
       },
     });
@@ -496,16 +511,24 @@ Final Answer: [your response]`;
 
   async initializeGameDirectly(): Promise<string> {
     const stateClient = this.mcpClients.find((c) => c.name === 'state');
-    const environmentClient = this.mcpClients.find((c) => c.name === 'environment');
+    const scenarioClient = this.mcpClients.find((c) => c.name === 'scenario');
 
     if (!stateClient) {
       throw new Error('State server not found');
     }
 
+    if (!this.userLocation) {
+      await this.detectUserLocation();
+    }
+
     try {
       const result = await stateClient.client.callTool({
         name: 'initialize_game',
-        arguments: {},
+        arguments: {
+          lat: this.userLocation?.lat,
+          lon: this.userLocation?.lon,
+          location_description: this.userLocation?.description,
+        },
       });
 
       const contentArray = result.content as Array<{ type: string; text?: string }>;
@@ -516,63 +539,328 @@ Final Answer: [your response]`;
 
       const data = JSON.parse(content.text);
 
-      let weatherInfo = '';
-      if (environmentClient) {
+      let scenarioText = '';
+      if (scenarioClient) {
         try {
-          const weatherResult = await environmentClient.client.callTool({
-            name: 'get_weather_conditions',
+          const scenarioResult = await scenarioClient.client.callTool({
+            name: 'generate_scenario',
             arguments: {
-              lat: 47.5,
-              lon: -121.0,
+              hours_survived: 0,
+              core_temperature_f: data.starting_conditions.core_temperature_f,
+              hydration_level: data.starting_conditions.hydration_level,
+              energy_level: data.starting_conditions.energy_level,
+              fatigue: data.starting_conditions.fatigue,
+              injuries: data.starting_conditions.injuries,
+              has_shelter: false,
+              has_fire: false,
+              has_water: false,
+              inventory_summary: [...data.inventory.gear, ...data.inventory.resources],
             },
           });
 
-          const weatherContentArray = weatherResult.content as Array<{
-            type: string;
-            text?: string;
-          }>;
-          const weatherContent = weatherContentArray[0];
-          if (weatherContent && weatherContent.type === 'text' && weatherContent.text) {
-            const weather = JSON.parse(weatherContent.text);
-            weatherInfo =
-              `\nCurrent Weather:\n` +
-              `- Temperature: ${weather.temperature}°${weather.temperature_unit}\n` +
-              `- Conditions: ${weather.short_forecast}\n` +
-              `- Wind: ${weather.wind_speed} ${weather.wind_direction || ''}\n` +
-              `- Precipitation Chance: ${weather.precipitation_probability}%\n`;
-
-            if (weather.detailed_forecast) {
-              weatherInfo += `- Forecast: ${weather.detailed_forecast}\n`;
+          const scenarioContentArray = scenarioResult.content as Array<{ type: string; text?: string }>;
+          const scenarioContent = scenarioContentArray[0];
+          if (scenarioContent && scenarioContent.type === 'text' && scenarioContent.text) {
+            const scenario = JSON.parse(scenarioContent.text);
+            if (scenario.scenario) {
+              scenarioText = `\n\n${scenario.scenario.title}\n\n${scenario.scenario.description}`;
             }
           }
-        } catch (weatherError) {
-          console.warn(
-            'Could not fetch weather conditions:',
-            weatherError instanceof Error ? weatherError.message : String(weatherError)
-          );
-          weatherInfo = '\nWeather: Unable to fetch current conditions\n';
+        } catch (scenarioError) {
+          console.warn('Could not generate scenario:', scenarioError instanceof Error ? scenarioError.message : String(scenarioError));
         }
       }
 
-      return (
-        `Game initialized! ${data.message}\n\nStarting Conditions:\n` +
-        `- Core Temperature: ${data.starting_conditions.core_temperature_f}°F\n` +
-        `- Hydration: ${data.starting_conditions.hydration_level}%\n` +
-        `- Energy: ${data.starting_conditions.energy_level}%\n` +
-        `- Fatigue: ${data.starting_conditions.fatigue}%\n` +
-        `- Injuries: ${data.starting_conditions.injuries.join(', ')}\n` +
-        weatherInfo +
-        `\nInventory:\n` +
-        `- Clothing: ${data.inventory.clothing.join(', ')}\n` +
-        `- Gear: ${data.inventory.gear.join(', ')}\n` +
-        `- Resources: ${data.inventory.resources.length > 0 ? data.inventory.resources.join(', ') : 'None'}\n` +
-        `- Food: ${data.inventory.food.length > 0 ? data.inventory.food.join(', ') : 'None'}\n\n` +
-        `You've been lost for 2 hours already. Your priority is to find shelter and water.`
-      );
+      return `${data.message} Your priority is to find shelter and water.${scenarioText}`;
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      throw new Error(`Failed to initialize game: ${errorMessage}`);
+      throw new Error(`Failed to initialize: ${errorMessage}`);
     }
+  }
+
+  async getCurrentStatus(): Promise<{
+    vitals: {
+      core_temperature_f: number;
+      hydration_level: number;
+      energy_level: number;
+      fatigue: number;
+      injuries: string[];
+    };
+    inventory: {
+      clothing: string[];
+      gear: string[];
+      resources: string[];
+      food: string[];
+    };
+  }> {
+    const stateClient = this.mcpClients.find((c) => c.name === 'state');
+    if (!stateClient) {
+      throw new Error('State server not found');
+    }
+
+    const result = await stateClient.client.callTool({
+      name: 'check_status',
+      arguments: {},
+    });
+
+    const contentArray = result.content as Array<{ type: string; text?: string }>;
+    const content = contentArray[0];
+    if (!content || content.type !== 'text' || !content.text) {
+      throw new Error('Invalid status response');
+    }
+
+    const status = JSON.parse(content.text);
+    return {
+      vitals: status.vitals,
+      inventory: status.inventory,
+    };
+  }
+
+  async getCurrentScenario(): Promise<{
+    has_active_scenario: boolean;
+    scenario: {
+      id: string;
+      type: string;
+      title: string;
+      description: string;
+      options: Array<{
+        id: number;
+        action: string;
+        risk_level: string;
+        energy_cost: string;
+        time_estimate: string;
+      }>;
+    } | null;
+  }> {
+    const scenarioClient = this.mcpClients.find((c) => c.name === 'scenario');
+    if (!scenarioClient) {
+      return { has_active_scenario: false, scenario: null };
+    }
+
+    try {
+      const result = await scenarioClient.client.callTool({
+        name: 'get_current_scenario',
+        arguments: {},
+      });
+
+      const contentArray = result.content as Array<{ type: string; text?: string }>;
+      const content = contentArray[0];
+      if (content && content.type === 'text' && content.text) {
+        return JSON.parse(content.text);
+      }
+    } catch {
+      // No active scenario
+    }
+
+    return { has_active_scenario: false, scenario: null };
+  }
+
+  async generateNewScenario(): Promise<{
+    scenario: {
+      id: string;
+      type: string;
+      title: string;
+      description: string;
+      options: Array<{
+        id: number;
+        action: string;
+        risk_level: string;
+        energy_cost: string;
+        time_estimate: string;
+      }>;
+    } | null;
+  }> {
+    const scenarioClient = this.mcpClients.find((c) => c.name === 'scenario');
+    const stateClient = this.mcpClients.find((c) => c.name === 'state');
+    
+    if (!scenarioClient || !stateClient) {
+      return { scenario: null };
+    }
+
+    try {
+      // Get current status for context
+      const statusResult = await stateClient.client.callTool({
+        name: 'check_status',
+        arguments: {},
+      });
+
+      const statusContent = (statusResult.content as Array<{ type: string; text?: string }>)[0];
+      const status = statusContent?.text ? JSON.parse(statusContent.text) : {};
+
+      // Generate new scenario with context
+      const result = await scenarioClient.client.callTool({
+        name: 'generate_scenario',
+        arguments: {
+          hours_survived: status.hours_survived || 0,
+          core_temperature_f: status.vitals?.core_temperature_f || 98.6,
+          hydration_level: status.vitals?.hydration_level || 80,
+          energy_level: status.vitals?.energy_level || 70,
+          fatigue: status.vitals?.fatigue || 30,
+          injuries: status.vitals?.injuries || [],
+          has_shelter: status.shelter_built || false,
+          has_fire: status.fire_active || false,
+          has_water: false,
+          inventory_summary: [
+            ...(status.inventory?.gear || []),
+            ...(status.inventory?.resources || []),
+          ],
+        },
+      });
+
+      const contentArray = result.content as Array<{ type: string; text?: string }>;
+      const content = contentArray[0];
+      if (content && content.type === 'text' && content.text) {
+        const data = JSON.parse(content.text);
+        return { scenario: data.scenario };
+      }
+    } catch (error) {
+      console.warn('Could not generate scenario:', error instanceof Error ? error.message : String(error));
+    }
+
+    return { scenario: null };
+  }
+
+  /**
+   * Parse numbered options from AI response text
+   * Looks for patterns like:
+   * 1. **Title** - Description
+   * or
+   * 1. Title - Description
+   */
+  parseOptionsFromResponse(response: string): Array<{ id: number; text: string }> {
+    const options: Array<{ id: number; text: string }> = [];
+    
+    // Match patterns like "1. **Title** - Description" or "1. Title - Description"
+    const optionRegex = /^(\d+)\.\s*\*?\*?([^*\n]+)\*?\*?\s*[-–—]?\s*(.*)$/gm;
+    
+    let match;
+    while ((match = optionRegex.exec(response)) !== null) {
+      const id = parseInt(match[1], 10);
+      const title = match[2].trim();
+      const description = match[3]?.trim() || '';
+      
+      // Combine title and description
+      const text = description ? `${title} - ${description}` : title;
+      
+      // Only add if it looks like a real option (not just a numbered list item in explanation)
+      if (id >= 1 && id <= 5 && title.length > 3) {
+        options.push({ id, text });
+      }
+    }
+    
+    // Also try simpler pattern: "1. Some action text"
+    if (options.length === 0) {
+      const simpleRegex = /^(\d+)\.\s+(.+)$/gm;
+      while ((match = simpleRegex.exec(response)) !== null) {
+        const id = parseInt(match[1], 10);
+        const text = match[2].trim().replace(/\*\*/g, '');
+        
+        if (id >= 1 && id <= 5 && text.length > 10) {
+          options.push({ id, text });
+        }
+      }
+    }
+    
+    return options;
+  }
+
+  /**
+   * Get the action text for a selected option number
+   */
+  getActionForOption(response: string, optionNumber: number): string | null {
+    const options = this.parseOptionsFromResponse(response);
+    const option = options.find(o => o.id === optionNumber);
+    return option?.text || null;
+  }
+
+  async getCurrentWeather(): Promise<string> {
+    const environmentClient = this.mcpClients.find((c) => c.name === 'environment');
+    const stateClient = this.mcpClients.find((c) => c.name === 'state');
+    
+    if (!environmentClient) {
+      return '🌤️ Weather: Unable to fetch\n';
+    }
+
+    let lat = this.userLocation?.lat || 47.5;
+    let lon = this.userLocation?.lon || -121.0;
+
+    if (stateClient) {
+      try {
+        const locationResult = await stateClient.client.callTool({
+          name: 'get_location',
+          arguments: {},
+        });
+        const locationContentArray = locationResult.content as Array<{ type: string; text?: string }>;
+        const locationContent = locationContentArray[0];
+        if (locationContent && locationContent.type === 'text' && locationContent.text) {
+          const location = JSON.parse(locationContent.text);
+          lat = location.lat;
+          lon = location.lon;
+        }
+      } catch {
+        // Use fallback
+      }
+    }
+
+    try {
+      const weatherResult = await environmentClient.client.callTool({
+        name: 'get_weather_conditions',
+        arguments: { lat, lon },
+      });
+
+      const weatherContentArray = weatherResult.content as Array<{ type: string; text?: string }>;
+      const weatherContent = weatherContentArray[0];
+      if (weatherContent && weatherContent.type === 'text' && weatherContent.text) {
+        const weather = JSON.parse(weatherContent.text);
+        return (
+          `🌤️ Weather:\n` +
+          `  • Temperature: ${weather.temperature}°${weather.temperature_unit}\n` +
+          `  • Conditions: ${weather.short_forecast}\n` +
+          `  • Wind: ${weather.wind_speed} ${weather.wind_direction || ''}\n` +
+          `  • Precipitation: ${weather.precipitation_probability}%\n`
+        );
+      }
+    } catch (error) {
+      console.warn('Weather fetch failed:', error instanceof Error ? error.message : String(error));
+    }
+
+    return '🌤️ Weather: Unable to fetch\n';
+  }
+
+  formatConditions(
+    vitals: {
+      core_temperature_f: number;
+      hydration_level: number;
+      energy_level: number;
+      fatigue: number;
+      injuries: string[];
+    },
+    label: 'Starting Conditions' | 'Current Conditions' = 'Current Conditions'
+  ): string {
+    const emoji = label === 'Starting Conditions' ? '🏁' : '🧭';
+    return (
+      `${emoji} ${label}:\n` +
+      `  • Core Temp: ${vitals.core_temperature_f.toFixed(1)}°F\n` +
+      `  • Hydration: ${vitals.hydration_level}%\n` +
+      `  • Energy: ${vitals.energy_level}%\n` +
+      `  • Fatigue: ${vitals.fatigue}%\n` +
+      `  • Injuries: ${vitals.injuries.length > 0 ? vitals.injuries.join(', ') : 'None'}\n`
+    );
+  }
+
+  formatInventory(inventory: {
+    clothing: string[];
+    gear: string[];
+    resources: string[];
+    food: string[];
+  }): string {
+    return (
+      `🎒 Inventory:\n` +
+      `  • Clothing: ${inventory.clothing.join(', ')}\n` +
+      `  • Gear: ${inventory.gear.join(', ')}\n` +
+      `  • Resources: ${inventory.resources.length > 0 ? inventory.resources.join(', ') : 'None'}\n` +
+      `  • Food: ${inventory.food.length > 0 ? inventory.food.join(', ') : 'None'}\n`
+    );
   }
 
   async cleanup(): Promise<void> {
