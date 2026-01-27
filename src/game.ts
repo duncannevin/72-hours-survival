@@ -108,7 +108,7 @@ class FlexibleReActParser extends BaseOutputParser<AgentAction | AgentFinish> {
     // Remove XML-like tags
     cleanText = cleanText.replace(/<tool_output>[\s\S]*?<\/tool_output>/gi, '');
     cleanText = cleanText.replace(/<observation>[\s\S]*?<\/observation>/gi, '');
-    cleanText = cleanText.replace(/<result>[\s\S]*?<\/result>/gi, '');
+    cleanText = cleanText.replace(/<r>[\s\S]*?<\/result>/gi, '');
     
     // Check for Final Answer
     const finalAnswerMatch = cleanText.match(/Final Answer:\s*([\s\S]*?)$/i);
@@ -225,6 +225,20 @@ export class SurvivalGame {
     this.mcpClients = [];
   }
 
+  /**
+   * Set the user's location manually
+   */
+  setLocation(location: {
+    lat: number;
+    lon: number;
+    city: string;
+    region: string;
+    country: string;
+    description: string;
+  }): void {
+    this.userLocation = location;
+  }
+
   async detectUserLocation(): Promise<UserLocation> {
     try {
       const response = await axios.get('http://ip-api.com/json/', { timeout: 5000 });
@@ -300,6 +314,7 @@ export class SurvivalGame {
       { name: 'environment', script: 'src/mcp-servers/environment-server.ts' },
       { name: 'knowledge', script: 'src/mcp-servers/knowledge-server.ts' },
       { name: 'scenario', script: 'src/mcp-servers/scenario-server.ts' },
+      { name: 'wildlife', script: 'src/mcp-servers/wildlife-server.ts' },
     ];
 
     for (const server of servers) {
@@ -320,8 +335,6 @@ export class SurvivalGame {
         const toolsList = await client.listTools();
 
         for (const tool of toolsList.tools) {
-          // Create a permissive schema that accepts any object
-          // This prevents schema validation errors from the agent
           const permissiveSchema = z.object({}).passthrough();
 
           const langchainTool = new DynamicStructuredTool({
@@ -330,8 +343,6 @@ export class SurvivalGame {
             schema: permissiveSchema,
             func: async (input: Record<string, unknown>) => {
               try {
-                // Filter out any extra properties the LLM might have added
-                // Only pass through properties that the MCP tool actually expects
                 const expectedProps = Object.keys(
                   (tool.inputSchema as { properties?: Record<string, unknown> })?.properties || {}
                 );
@@ -373,16 +384,32 @@ export class SurvivalGame {
     console.log(`\n✓ Loaded ${this.tools.length} tools from MCP servers\n`);
   }
 
-  createAgent(): AgentExecutor {
+  createAgent(
+    playerContext: string = '',
+    getConversationHistory: () => string = () => ''
+  ): AgentExecutor {
     const toolNames = this.tools.map((t) => t.name);
     const toolNamesStr = toolNames.join(', ');
 
-    // Build a more detailed tool description that includes parameter info
     const toolsDescription = this.tools
       .map((t) => `• ${t.name}: ${t.description}`)
       .join('\n');
 
-    const PROMPT_TEMPLATE = `You are a wilderness survival expert simulating a realistic 72-hour survival scenario.
+    const buildPromptTemplate = (): string => {
+      const historyContext = getConversationHistory();
+      
+      return `You are a wilderness survival expert simulating a realistic 72-hour survival scenario.
+
+CRITICAL NARRATIVE RULES:
+1. NEVER restart or re-introduce the scenario
+2. ALWAYS continue from where the story left off
+3. React specifically to the player's current action
+4. Keep the narrative consistent and immersive
+5. Reference previous events when relevant
+6. Do NOT repeat information the player already knows
+
+${playerContext ? `PLAYER CONTEXT:\n${playerContext}\n` : ''}
+${historyContext}
 
 AVAILABLE TOOLS:
 {tools}
@@ -396,33 +423,22 @@ Action Input: [valid JSON - use {{}} for tools with no required parameters]
 
 To give final answer:
 Thought: I have enough information.
-Final Answer: [your response - MUST end with numbered options]
+Final Answer: [your response continuing the narrative]
 
 TOOLS: ${toolNamesStr}
 
-YOUR FINAL ANSWER MUST INCLUDE:
-1. **What Happened**: Describe the outcome of their action (2-3 sentences)
-2. **Current Situation**: The new challenge or situation they face
-3. **Numbered Options**: ALWAYS end with exactly 3 options formatted like this:
-
-Your options:
-1. **[Brief action title]** - [Description of this choice]
-2. **[Brief action title]** - [Description of this choice]  
-3. **[Brief action title]** - [Description of this choice]
-
-RULES FOR OPTIONS:
-- Always provide exactly 3 options
-- Options should be contextually appropriate to the situation
-- Include a mix of safe/risky choices
-- Make options specific to the current scenario
-- Format: Number. **Bold Title** - Description
+YOUR FINAL ANSWER SHOULD:
+1. Describe what happened as a result of their action (be specific and immersive)
+2. Present the new situation or challenge they face
+3. Optionally suggest 2-3 possible next actions
 
 SURVIVAL PRIORITIES: Shelter > Water > Fire > Food
 
 Question: {input}
 {agent_scratchpad}`;
+    };
 
-    const prompt = PromptTemplate.fromTemplate(PROMPT_TEMPLATE);
+    const prompt = PromptTemplate.fromTemplate(buildPromptTemplate());
 
     const modelWithStop = this.llm.bind({
       stop: ['\nObservation:', 'Observation:'],
@@ -486,7 +502,6 @@ Observation: ${step.observation}`;
       tools: this.tools,
       verbose: process.env.NODE_ENV === 'development',
       maxIterations: MAX_ITERATIONS,
-      earlyStoppingMethod: 'force',
       handleParsingErrors: (error) => {
         const errorMsg = error instanceof Error ? error.message : String(error);
         return `Error: ${errorMsg}
@@ -616,6 +631,115 @@ Final Answer: [your response]`;
     };
   }
 
+  /**
+   * Get full game status including hours survived and flags
+   */
+  async getFullStatus(): Promise<{
+    hours_survived: number;
+    vitals: {
+      core_temperature_f: number;
+      hydration_level: number;
+      energy_level: number;
+      fatigue: number;
+      injuries: string[];
+    };
+    inventory: {
+      clothing: string[];
+      gear: string[];
+      resources: string[];
+      food: string[];
+    };
+    shelter_built: boolean;
+    fire_active: boolean;
+  }> {
+    const stateClient = this.mcpClients.find((c) => c.name === 'state');
+    if (!stateClient) {
+      throw new Error('State server not found');
+    }
+
+    const result = await stateClient.client.callTool({
+      name: 'check_status',
+      arguments: {},
+    });
+
+    const contentArray = result.content as Array<{ type: string; text?: string }>;
+    const content = contentArray[0];
+    if (!content || content.type !== 'text' || !content.text) {
+      throw new Error('Invalid status response');
+    }
+
+    const status = JSON.parse(content.text);
+    return {
+      hours_survived: status.hours_survived || 0,
+      vitals: status.vitals,
+      inventory: status.inventory,
+      shelter_built: status.shelter_built || false,
+      fire_active: status.fire_active || false,
+    };
+  }
+
+  /**
+   * Restore game state from a saved game
+   */
+  async restoreGameState(savedState: {
+    hours_survived: number;
+    player_vitals: {
+      core_temperature_f: number;
+      hydration_level: number;
+      energy_level: number;
+      fatigue: number;
+      injuries: string[];
+    };
+    inventory: {
+      clothing: string[];
+      gear: string[];
+      resources: string[];
+      food: string[];
+    };
+    location: {
+      lat: number;
+      lon: number;
+      description: string;
+    };
+    shelter_built: boolean;
+    fire_active: boolean;
+  }): Promise<void> {
+    const stateClient = this.mcpClients.find((c) => c.name === 'state');
+    if (!stateClient) {
+      throw new Error('State server not found');
+    }
+
+    // Try restore_state tool first
+    try {
+      await stateClient.client.callTool({
+        name: 'restore_state',
+        arguments: savedState,
+      });
+    } catch {
+      // Fallback: initialize then manually set state
+      console.warn('restore_state not available, using fallback...');
+      
+      await stateClient.client.callTool({
+        name: 'initialize_game',
+        arguments: {
+          lat: savedState.location.lat,
+          lon: savedState.location.lon,
+          location_description: savedState.location.description,
+        },
+      });
+    }
+
+    // Update internal location
+    this.userLocation = {
+      lat: savedState.location.lat,
+      lon: savedState.location.lon,
+      city: '',
+      region: '',
+      country: '',
+      description: savedState.location.description,
+    };
+  }
+
   async getCurrentScenario(): Promise<{
     has_active_scenario: boolean;
     scenario: {
@@ -678,7 +802,6 @@ Final Answer: [your response]`;
     }
 
     try {
-      // Get current status for context
       const statusResult = await stateClient.client.callTool({
         name: 'check_status',
         arguments: {},
@@ -687,7 +810,6 @@ Final Answer: [your response]`;
       const statusContent = (statusResult.content as Array<{ type: string; text?: string }>)[0];
       const status = statusContent?.text ? JSON.parse(statusContent.text) : {};
 
-      // Generate new scenario with context
       const result = await scenarioClient.client.callTool({
         name: 'generate_scenario',
         arguments: {
@@ -720,17 +842,9 @@ Final Answer: [your response]`;
     return { scenario: null };
   }
 
-  /**
-   * Parse numbered options from AI response text
-   * Looks for patterns like:
-   * 1. **Title** - Description
-   * or
-   * 1. Title - Description
-   */
   parseOptionsFromResponse(response: string): Array<{ id: number; text: string }> {
     const options: Array<{ id: number; text: string }> = [];
     
-    // Match patterns like "1. **Title** - Description" or "1. Title - Description"
     const optionRegex = /^(\d+)\.\s*\*?\*?([^*\n]+)\*?\*?\s*[-–—]?\s*(.*)$/gm;
     
     let match;
@@ -739,16 +853,13 @@ Final Answer: [your response]`;
       const title = match[2].trim();
       const description = match[3]?.trim() || '';
       
-      // Combine title and description
       const text = description ? `${title} - ${description}` : title;
       
-      // Only add if it looks like a real option (not just a numbered list item in explanation)
       if (id >= 1 && id <= 5 && title.length > 3) {
         options.push({ id, text });
       }
     }
     
-    // Also try simpler pattern: "1. Some action text"
     if (options.length === 0) {
       const simpleRegex = /^(\d+)\.\s+(.+)$/gm;
       while ((match = simpleRegex.exec(response)) !== null) {
@@ -764,9 +875,6 @@ Final Answer: [your response]`;
     return options;
   }
 
-  /**
-   * Get the action text for a selected option number
-   */
   getActionForOption(response: string, optionNumber: number): string | null {
     const options = this.parseOptionsFromResponse(response);
     const option = options.find(o => o.id === optionNumber);

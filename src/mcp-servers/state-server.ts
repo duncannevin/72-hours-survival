@@ -74,6 +74,46 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: 'restore_state',
+        description: 'Restore a previously saved game state',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            hours_survived: { type: 'number' },
+            player_vitals: {
+              type: 'object',
+              properties: {
+                core_temperature_f: { type: 'number' },
+                hydration_level: { type: 'number' },
+                energy_level: { type: 'number' },
+                fatigue: { type: 'number' },
+                injuries: { type: 'array', items: { type: 'string' } },
+              },
+            },
+            inventory: {
+              type: 'object',
+              properties: {
+                clothing: { type: 'array', items: { type: 'string' } },
+                gear: { type: 'array', items: { type: 'string' } },
+                resources: { type: 'array', items: { type: 'string' } },
+                food: { type: 'array', items: { type: 'string' } },
+              },
+            },
+            location: {
+              type: 'object',
+              properties: {
+                lat: { type: 'number' },
+                lon: { type: 'number' },
+                description: { type: 'string' },
+              },
+            },
+            shelter_built: { type: 'boolean' },
+            fire_active: { type: 'boolean' },
+          },
+          required: ['hours_survived', 'player_vitals', 'inventory', 'location'],
+        },
+      },
+      {
         name: 'get_location',
         description: 'Get the current game location coordinates',
         inputSchema: {
@@ -128,6 +168,28 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: 'set_shelter',
+        description: 'Set whether the player has built a shelter',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            built: { type: 'boolean' },
+          },
+          required: ['built'],
+        },
+      },
+      {
+        name: 'set_fire',
+        description: 'Set whether the player has an active fire',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            active: { type: 'boolean' },
+          },
+          required: ['active'],
+        },
+      },
+      {
         name: 'advance_time',
         description: 'Move game time forward and apply passive effects',
         inputSchema: {
@@ -169,9 +231,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
 
       gameState.hours_survived = 0;
-      gameState.player_vitals.core_temperature_f = 97.5; // Slightly cold
-      gameState.player_vitals.hydration_level = 60; // Thirsty
+      gameState.player_vitals.core_temperature_f = 97.5;
+      gameState.player_vitals.hydration_level = 60;
+      gameState.player_vitals.energy_level = 70;
+      gameState.player_vitals.fatigue = 30;
       gameState.player_vitals.injuries = ['Minor ankle sprain'];
+      gameState.shelter_built = false;
+      gameState.fire_active = false;
+      gameState.decisions_log = [];
+      
+      // Reset inventory to default
+      gameState.inventory = {
+        clothing: ['hiking boots', 'jeans', 't-shirt', 'light jacket'],
+        gear: ['backpack', 'water bottle (empty)', 'knife'],
+        resources: [],
+        food: []
+      };
       
       // Update location if provided
       if (initArgs.lat !== undefined && initArgs.lon !== undefined) {
@@ -191,6 +266,58 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               starting_conditions: gameState.player_vitals,
               inventory: gameState.inventory,
               location: gameState.location
+            }, null, 2),
+          },
+        ],
+      };
+    }
+
+    case 'restore_state': {
+      const restoreArgs = args as {
+        hours_survived: number;
+        player_vitals: {
+          core_temperature_f: number;
+          hydration_level: number;
+          energy_level: number;
+          fatigue: number;
+          injuries: string[];
+        };
+        inventory: {
+          clothing: string[];
+          gear: string[];
+          resources: string[];
+          food: string[];
+        };
+        location: {
+          lat: number;
+          lon: number;
+          description: string;
+        };
+        shelter_built?: boolean;
+        fire_active?: boolean;
+      };
+
+      // Restore all state
+      gameState.hours_survived = restoreArgs.hours_survived;
+      gameState.player_vitals = { ...restoreArgs.player_vitals };
+      gameState.inventory = { ...restoreArgs.inventory };
+      gameState.location = { ...restoreArgs.location };
+      gameState.shelter_built = restoreArgs.shelter_built || false;
+      gameState.fire_active = restoreArgs.fire_active || false;
+      gameState.decisions_log = [];
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              message: 'Game state restored successfully.',
+              hours_survived: gameState.hours_survived,
+              vitals: gameState.player_vitals,
+              inventory: gameState.inventory,
+              location: gameState.location,
+              shelter_built: gameState.shelter_built,
+              fire_active: gameState.fire_active,
             }, null, 2),
           },
         ],
@@ -335,6 +462,40 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
 
+    case 'set_shelter': {
+      const { built } = args as { built: boolean };
+      gameState.shelter_built = built;
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              message: built ? 'Shelter built!' : 'Shelter removed/destroyed',
+              shelter_built: gameState.shelter_built
+            }, null, 2),
+          },
+        ],
+      };
+    }
+
+    case 'set_fire': {
+      const { active } = args as { active: boolean };
+      gameState.fire_active = active;
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              message: active ? 'Fire started!' : 'Fire went out',
+              fire_active: gameState.fire_active
+            }, null, 2),
+          },
+        ],
+      };
+    }
+
     case 'advance_time': {
       const { hours, activity_level, sheltered = false, near_fire = false } = args as {
         hours: number;
@@ -349,8 +510,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       
       // Temperature effects
       let tempChange = 0;
-      if (!sheltered) tempChange -= 0.3 * hours;
-      if (near_fire) tempChange += 0.5 * hours;
+      if (!sheltered && !gameState.shelter_built) tempChange -= 0.3 * hours;
+      if (near_fire || gameState.fire_active) tempChange += 0.5 * hours;
       vitals.core_temperature_f += tempChange;
       
       // Hydration loss
@@ -427,7 +588,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         hours_remaining: 72 - hours,
         status,
         vitals_summary: {
-          temperature: `${vitals.core_temperature_f}°F`,
+          temperature: `${vitals.core_temperature_f.toFixed(1)}°F`,
           hydration: `${vitals.hydration_level}%`,
           energy: `${vitals.energy_level}%`,
           fatigue: `${vitals.fatigue}%`
@@ -458,11 +619,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  // Server is running silently on stdio
 }
 
 main().catch((error) => {
-  // Only log fatal errors that prevent server startup
   process.stderr.write(`Fatal server error: ${error}\n`);
   process.exit(1);
 });
