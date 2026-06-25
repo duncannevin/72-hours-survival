@@ -33,9 +33,9 @@ function ask(question: string): Promise<string> {
 const SPINNER_FRAMES = [
   '🌲 🚶 🌲 🌲 🌲',
   '🌲 🌲 🚶 🌲 🌲',
-  '🌲 🌲 🌲 🚶 🌲',
-  '🌲 🌲 🌲 🌲 🚶',
-  '🌲 🌲 🌲 🚶 🌲',
+  '🌲 🌲 🚶 🚶 🌲',
+  '🌲 🌲 🚶 🌲 🚶',
+  '🌲 🌲 🚶 🚶 🌲',
   '🌲 🌲 🚶 🌲 🌲',
 ];
 
