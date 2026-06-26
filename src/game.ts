@@ -13,6 +13,7 @@ import { z } from 'zod';
 import type { MCPClientInfo, MCPServerConfig } from './types/game.js';
 
 const MAX_ITERATIONS = 10;
+const GAME_VERSION = '1.0.1';
 
 interface UserLocation {
   lat: number;
